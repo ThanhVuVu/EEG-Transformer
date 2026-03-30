@@ -64,6 +64,7 @@ class ResidualAdd(nn.Module):
         super().__init__()
         self.fn = fn
     def forward(self, x, **kwargs):
+        # Residual/skip connection: x + fn(x)
         res = x
         x = self.fn(x, **kwargs)
         x += res
@@ -82,11 +83,13 @@ class TransformerEncoderBlock(nn.Sequential):
     def __init__(self, emb_size, num_heads=5, drop_p=0.5, forward_expansion=4, forward_drop_p=0.5):
         super().__init__(
             ResidualAdd(nn.Sequential(
+                # Attention sublayer with residual add
                 nn.LayerNorm(emb_size),
                 MultiHeadAttention(emb_size, num_heads, drop_p),
                 nn.Dropout(drop_p)
             )),
             ResidualAdd(nn.Sequential(
+                # Feed-forward sublayer with residual add
                 nn.LayerNorm(emb_size),
                 FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
                 nn.Dropout(drop_p)
@@ -167,6 +170,7 @@ class ViT(nn.Sequential):
         super().__init__(
             ResidualAdd(
                 nn.Sequential(
+                    # Initial channel-attention block with residual add
                     nn.LayerNorm(500), # Norm across exact 500 subsequence timeline
                     channel_attention(sequence_num=500, inter=10),
                     nn.Dropout(0.5),
@@ -194,6 +198,12 @@ class Trans():
         
         self.criterion_cls = torch.nn.CrossEntropyLoss().to(self.device)
         self.model = ViT(n_classes=4).to(self.device)
+
+        # Smoke test: run a few forward/backward/optimizer steps on a small fraction
+        # of train/val to verify the pipeline. After smoke, we restore weights so
+        # full training is unaffected.
+        self.smoke_fraction = 0.05
+        self.smoke_max_batches = 10
         
         if torch.cuda.is_available():
             self.model = nn.DataParallel(self.model, device_ids=[i for i in range(len(gpus))])
@@ -216,6 +226,87 @@ class Trans():
         
         self.train_loader, self.val_loader, self.test_loader = get_dataloaders(self.root, batch_size=self.batch_size)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
+
+        # -------------------------
+        # Non-destructive smoke run
+        # -------------------------
+        if self.smoke_fraction and self.smoke_fraction > 0:
+            # Save initial weights (for DataParallel this includes the 'module.' prefix).
+            initial_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+
+            smoke_train_steps = int(len(self.train_loader) * self.smoke_fraction) if len(self.train_loader) > 0 else 0
+            smoke_train_steps = min(len(self.train_loader), self.smoke_max_batches, max(1, smoke_train_steps))
+
+            smoke_val_steps = int(len(self.val_loader) * self.smoke_fraction) if len(self.val_loader) > 0 else 0
+            smoke_val_steps = min(len(self.val_loader), self.smoke_max_batches, max(1, smoke_val_steps))
+
+            if smoke_train_steps == 0 or smoke_val_steps == 0:
+                print("[SMOKE] Skipping smoke run because one of the dataloaders is empty.")
+            else:
+                print(f"\n[SMOKE] Running for up to {smoke_train_steps} train batches and {smoke_val_steps} val batches...")
+                self.log_write.write(f"[SMOKE] Running for up to {smoke_train_steps} train batches and {smoke_val_steps} val batches...\n")
+
+                self.model.train()
+                smoke_train_loss_accum = 0.0
+                y_true_train, y_pred_train = [], []
+
+                for i, (img, label) in enumerate(self.train_loader):
+                    if i >= smoke_train_steps:
+                        break
+
+                    # Dataset contract: img is (B, 1, 12, 500), label is (B,) with values in {0,1,2,3}.
+                    img = img.to(self.device)
+                    label = label.to(self.device)
+
+                    tok, outputs = self.model(img)
+                    # Model contract: outputs are raw logits with shape (B, 4); tok is the transformer tokens.
+                    loss = self.criterion_cls(outputs, label)
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+
+                    smoke_train_loss_accum += loss.item()
+                    preds = torch.max(outputs, 1)[1]
+                    y_true_train.extend(label.cpu().numpy())
+                    y_pred_train.extend(preds.cpu().numpy())
+
+                self.model.eval()
+                smoke_val_loss_accum = 0.0
+                y_true_val, y_pred_val = [], []
+
+                with torch.no_grad():
+                    for i, (img, label) in enumerate(self.val_loader):
+                        if i >= smoke_val_steps:
+                            break
+
+                        img = img.to(self.device)
+                        label = label.to(self.device)
+
+                        tok, outputs = self.model(img)
+                        loss = self.criterion_cls(outputs, label)
+
+                        smoke_val_loss_accum += loss.item()
+                        preds = torch.max(outputs, 1)[1]
+                        y_true_val.extend(label.cpu().numpy())
+                        y_pred_val.extend(preds.cpu().numpy())
+
+                tr_acc, tr_prec, tr_rec, tr_f1 = self.compute_metrics(y_true_train, y_pred_train)
+                vl_acc, vl_prec, vl_rec, vl_f1 = self.compute_metrics(y_true_val, y_pred_val)
+
+                avg_smoke_train_loss = smoke_train_loss_accum / max(1, smoke_train_steps)
+                avg_smoke_val_loss = smoke_val_loss_accum / max(1, smoke_val_steps)
+
+                smoke_str = (f"[SMOKE RESULTS] "
+                             f"Train Loss: {avg_smoke_train_loss:.4f} | Train F1: {tr_f1:.4f} "
+                             f"| Val Loss: {avg_smoke_val_loss:.4f} | Val F1: {vl_f1:.4f}")
+                print(smoke_str)
+                self.log_write.write(smoke_str + "\n")
+
+                # Restore original weights so the later training is unaffected.
+                self.model.load_state_dict(initial_state)
+                # Reset optimizer state for a clean start.
+                self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
 
         best_f1 = 0
         
