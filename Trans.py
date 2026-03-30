@@ -189,7 +189,7 @@ class Trans():
         self.lr = 0.0002
         self.b1 = 0.5
         self.b2 = 0.9
-        self.root = r'd:\12 lead ECG\WFDB_ChapmanShaoxing'
+        self.root = '/kaggle/input/datasets/erarayamorenzomuten/chapmanshaoxing-12lead-ecg-database/WFDB_ChapmanShaoxing'
         
         os.makedirs("./results/", exist_ok=True)
         self.log_write = open("./results/log_chapman_metrics.txt", "w")
