@@ -1,0 +1,7 @@
+records_sampled=2000
+bad_files=0
+min(min)=-17080.0000
+max(max)=12166.0000
+mean(mean)=1.5478
+mean(std)=216.6720
+max(nan_frac)=0.000000

@@ -1,0 +1,83 @@
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        
+class BlockAttnRes(nn.Module):
+    """Block Attention Residuals.
+
+    Layers are partitioned into N blocks. Within each block, outputs
+    accumulate via standard addition. Across blocks, each layer attends
+    over block-level summaries using a learned pseudo-query.
+    """
+
+    def __init__(self, num_layers: int, d_model: int, block_size: int):
+        super().__init__()
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.block_size = block_size
+        self.w = nn.Parameter(torch.zeros(num_layers, d_model))
+        self.norm = RMSNorm(d_model)
+
+    def _attend(self, sources: list[torch.Tensor], query: torch.Tensor):
+        """Attend over a list of source tensors with a single query vector."""
+        V = torch.stack(sources)  # [N_src, B, T, D]
+        K = self.norm(V)
+        logits = torch.einsum('d, n b t d -> n b t', query, K)
+        weights = F.softmax(logits, dim=0)
+        h = torch.einsum('n b t, n b t d -> b t d', weights, V)
+        return h, weights
+
+    def forward(
+        self,
+        embedding: torch.Tensor,
+        layer_fns: list[nn.Module],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run a full forward pass with Block AttnRes.
+
+        Args:
+            embedding: [B, T, D] token embeddings
+            layer_fns: list of L callables
+
+        Returns:
+            output: [B, T, D] final hidden state
+            weight_records: list of (layer_idx, num_sources, avg_weights) tuples
+        """
+        L = len(layer_fns)
+        B, T, D = embedding.shape
+
+        blocks = [embedding]  # b_0 = h_1 (token embedding always included)
+        partial_block = None
+        weight_records = []
+
+        for l in range(L):
+            # Build source list for inter-block attention
+            if partial_block is not None:
+                sources = blocks + [partial_block]
+            else:
+                sources = list(blocks)
+
+            # Compute attention over sources
+            h_l, weights = self._attend(sources, self.w[l])
+
+            avg_w = weights.mean(dim=(1, 2)).detach()
+            weight_records.append((l, len(sources), avg_w))
+
+            # Apply layer transformation
+            v_l = layer_fns[l](h_l)
+
+            # Accumulate into partial block
+            if partial_block is None:
+                partial_block = v_l
+            else:
+                partial_block = partial_block + v_l
+
+            # Check block boundary
+            if (l + 1) % self.block_size == 0:
+                blocks.append(partial_block)
+                partial_block = None
+
+        return h_l, weight_records

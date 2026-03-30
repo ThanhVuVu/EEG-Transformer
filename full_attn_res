@@ -1,0 +1,77 @@
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+class FullAttnRes(nn.Module):
+    """Full Attention Residuals (Section 3.1 of the paper).
+
+    Each layer attends over all preceding layer outputs using a learned
+    pseudo-query vector w_l. Keys are RMSNorm'd layer outputs.
+    """
+
+    def __init__(self, num_layers: int, d_model: int):
+        super().__init__()
+        self.num_layers = num_layers
+        self.d_model = d_model
+        # One pseudo-query per layer, initialized to zero (paper Section 5)
+        self.w = nn.Parameter(torch.zeros(num_layers, d_model))
+        self.norm = RMSNorm(d_model)
+
+    def compute_weights(self, layer_idx: int, sources: torch.Tensor) -> torch.Tensor:
+        """Compute attention weights for one layer over its sources.
+
+        Args:
+            layer_idx: which layer (0-indexed)
+            sources: [num_sources, B, T, D] stacked source tensors
+
+        Returns:
+            weights: [num_sources, B, T] softmax attention weights
+        """
+        K = self.norm(sources)
+        q = self.w[layer_idx]  # [D]
+        logits = torch.einsum('d, n b t d -> n b t', q, K)
+        return F.softmax(logits, dim=0)
+
+    def forward(
+        self,
+        embedding: torch.Tensor,
+        layer_fns: list[nn.Module],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run a full forward pass with Full AttnRes.
+
+        Args:
+            embedding: [B, T, D] token embeddings (v_0 = h_1)
+            layer_fns: list of L callables, each [B, T, D] -> [B, T, D]
+
+        Returns:
+            output: [B, T, D] final hidden state
+            weight_matrix: [L, L+1] attention weight matrix (for visualization)
+        """
+        L = len(layer_fns)
+        assert L == self.num_layers
+        B, T, D = embedding.shape
+
+        layer_outputs = [embedding]  # v_0 = h_1
+        weight_matrix = torch.zeros(L, L + 1)
+
+        for l in range(L):
+            sources = torch.stack(layer_outputs)  # [l+1, B, T, D]
+            weights = self.compute_weights(l, sources)  # [l+1, B, T]
+
+            # Weighted sum -> input to layer l
+            h_l = torch.einsum('n b t, n b t d -> b t d', weights, sources)
+
+            # Record average weights for visualization
+            avg_w = weights.mean(dim=(1, 2)).detach()
+            weight_matrix[l, :l + 1] = avg_w
+
+            # Apply layer transformation
+            v_l = layer_fns[l](h_l)
+            layer_outputs.append(v_l)
+
+        # Final output: attend over all sources
+        return h_l, weight_matrix

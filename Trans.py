@@ -9,6 +9,7 @@ from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from torchsummary import summary
+from full_attn_res import FullAttnRes
 
 gpus = [0]
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -100,6 +101,46 @@ class TransformerEncoder(nn.Sequential):
     def __init__(self, depth, emb_size):
         super().__init__(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
 
+class TransformerBlockNoResidual(nn.Module):
+    def __init__(self, emb_size, num_heads=5, drop_p=0.5, forward_expansion=4, forward_drop_p=0.5):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.LayerNorm(emb_size),
+            MultiHeadAttention(emb_size, num_heads, drop_p),
+            nn.Dropout(drop_p),
+        )
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(emb_size),
+            FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
+            nn.Dropout(drop_p),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # No internal residual adds; residual mixing is handled by FullAttnRes.
+        x = self.attn(x)
+        x = self.ffn(x)
+        return x
+
+class FullAttnResEncoder(nn.Module):
+    def __init__(self, depth: int, emb_size: int, num_heads=5, drop_p=0.5, forward_expansion=4, forward_drop_p=0.5):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            TransformerBlockNoResidual(
+                emb_size=emb_size,
+                num_heads=num_heads,
+                drop_p=drop_p,
+                forward_expansion=forward_expansion,
+                forward_drop_p=forward_drop_p,
+            )
+            for _ in range(depth)
+        ])
+        self.attnres = FullAttnRes(num_layers=depth, d_model=emb_size)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, T, E]
+        out, _w = self.attnres(x, list(self.layers))
+        return out
+
 class ClassificationHead(nn.Sequential):
     def __init__(self, emb_size, n_classes):
         super().__init__()
@@ -166,7 +207,8 @@ class channel_attention(nn.Module):
         return out
 
 class ViT(nn.Sequential):
-    def __init__(self, emb_size=10, depth=3, n_classes=4, **kwargs):
+    def __init__(self, emb_size=10, depth=4, n_classes=4, use_full_attn_res=True, **kwargs):
+        encoder = FullAttnResEncoder(depth, emb_size) if use_full_attn_res else TransformerEncoder(depth, emb_size)
         super().__init__(
             ResidualAdd(
                 nn.Sequential(
@@ -177,7 +219,7 @@ class ViT(nn.Sequential):
                 )
             ),
             PatchEmbedding(emb_size),
-            TransformerEncoder(depth, emb_size),
+            encoder,
             ClassificationHead(emb_size, n_classes) # Bound to the 4 diagnostic nodes
         )
 
