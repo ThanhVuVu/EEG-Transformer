@@ -197,7 +197,7 @@ class Trans():
         self.lr = 0.0002
         self.b1 = 0.5
         self.b2 = 0.9
-        self.root = r'd:\archive (1)'  # New Kaggle local dir mapping
+        self.root = '/kaggle/input/datasets/shayanfazeli/heartbeat'  # Local data folder path directly provided to loader
         
         os.makedirs("./results/", exist_ok=True)
         self.log_write = open("./results/log_mitbih_training.txt", "w")
