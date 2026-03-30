@@ -1,19 +1,14 @@
 import os
 import numpy as np
-import math
 import random
-import time
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch import Tensor
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from torchsummary import summary
-from torch.backends import cudnn
-
-cudnn.benchmark = False
-cudnn.deterministic = True
 
 gpus = [0]
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -23,21 +18,18 @@ class PatchEmbedding(nn.Module):
     def __init__(self, emb_size):
         super().__init__()
         self.projection = nn.Sequential(
-            # Single channel input parsing for Kaggle Heartbeat Dataset
+            # Spatial dimensions: 1 Depth, 12 Channels, 500 Sequence Length
+            # 500 - 51 + 1 = 450 output length
             nn.Conv2d(1, 2, (1, 51), (1, 1)),
             nn.BatchNorm2d(2),
             nn.LeakyReLU(0.2),
-            # Height drops from 2 -> 1 for scalar mapping depth
-            nn.Conv2d(2, emb_size, (1, 5), stride=(1, 5)), 
+            # Compressing the 12 semantic spatial channels into standard patch lengths
+            nn.Conv2d(2, emb_size, (12, 5), stride=(12, 5)), 
             Rearrange('b e (h) (w) -> b (h w) e'),
         )
-        self.cls_token = nn.Parameter(torch.randn(1, 1, emb_size))
 
     def forward(self, x: Tensor) -> Tensor:
-        b, _, _, _ = x.shape
-        x = self.projection(x)
-        cls_tokens = repeat(self.cls_token, '() n e -> b n e', b=b)
-        return x
+        return self.projection(x)
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, emb_size, num_heads, dropout):
@@ -117,12 +109,72 @@ class ClassificationHead(nn.Sequential):
         out = self.clshead(x)
         return x, out
 
+class channel_attention(nn.Module):
+    def __init__(self, sequence_num=500, inter=10):
+        super(channel_attention, self).__init__()
+        self.sequence_num = sequence_num
+        self.inter = inter
+        self.extract_sequence = int(self.sequence_num / self.inter)
+
+        # Re-scaled for exact 12 spatial clinical channels
+        self.query = nn.Sequential(
+            nn.Linear(12, 12),
+            nn.LayerNorm(12),
+            nn.Dropout(0.3)
+        )
+        self.key = nn.Sequential(
+            nn.Linear(12, 12),
+            nn.LayerNorm(12),
+            nn.Dropout(0.3)
+        )
+
+        self.projection = nn.Sequential(
+            nn.Linear(12, 12),
+            nn.LayerNorm(12),
+            nn.Dropout(0.3),
+        )
+
+        self.drop_out = nn.Dropout(0)
+        self.pooling = nn.AvgPool2d(kernel_size=(1, self.inter), stride=(1, self.inter))
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        temp = rearrange(x, 'b o c s->b o s c')
+        temp_query = rearrange(self.query(temp), 'b o s c -> b o c s')
+        temp_key = rearrange(self.key(temp), 'b o s c -> b o c s')
+
+        channel_query = self.pooling(temp_query)
+        channel_key = self.pooling(temp_key)
+
+        scaling = self.extract_sequence ** (1 / 2)
+        channel_atten = torch.einsum('b o c s, b o m s -> b o c m', channel_query, channel_key) / scaling
+        channel_atten_score = F.softmax(channel_atten, dim=-1)
+        channel_atten_score = self.drop_out(channel_atten_score)
+
+        out = torch.einsum('b o c s, b o c m -> b o c s', x, channel_atten_score)
+        out = rearrange(out, 'b o c s -> b o s c')
+        out = self.projection(out)
+        out = rearrange(out, 'b o s c -> b o c s')
+        return out
+
 class ViT(nn.Sequential):
-    def __init__(self, emb_size=10, depth=3, n_classes=5, **kwargs):
+    def __init__(self, emb_size=10, depth=3, n_classes=4, **kwargs):
         super().__init__(
+            ResidualAdd(
+                nn.Sequential(
+                    nn.LayerNorm(500), # Norm across exact 500 subsequence timeline
+                    channel_attention(sequence_num=500, inter=10),
+                    nn.Dropout(0.5),
+                )
+            ),
             PatchEmbedding(emb_size),
             TransformerEncoder(depth, emb_size),
-            ClassificationHead(emb_size, n_classes)
+            ClassificationHead(emb_size, n_classes) # Bound to the 4 diagnostic nodes
         )
 
 class Trans():
@@ -130,54 +182,51 @@ class Trans():
         super(Trans, self).__init__()
         self.batch_size = 64
         self.n_epochs = 50
-        self.img_height = 1
-        self.img_width = 187
-        self.channels = 1
         self.lr = 0.0002
         self.b1 = 0.5
         self.b2 = 0.9
-        self.root = '/kaggle/input/datasets/shayanfazeli/heartbeat'  # Local data folder path directly provided to loader
+        self.root = r'd:\12 lead ECG\WFDB_ChapmanShaoxing'
         
         os.makedirs("./results/", exist_ok=True)
-        self.log_write = open("./results/log_mitbih_training.txt", "w")
+        self.log_write = open("./results/log_chapman_metrics.txt", "w")
 
-        # Fallbacks for seamless remote execution regardless of accelerators
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        self.Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
-        self.LongTensor = torch.cuda.LongTensor if torch.cuda.is_available() else torch.LongTensor
-
         self.criterion_cls = torch.nn.CrossEntropyLoss().to(self.device)
-
-        self.model = ViT().to(self.device)
+        self.model = ViT(n_classes=4).to(self.device)
+        
         if torch.cuda.is_available():
             self.model = nn.DataParallel(self.model, device_ids=[i for i in range(len(gpus))])
         
         try:
-            summary(self.model, (1, 1, 187), device=self.device.type)
+            summary(self.model, (1, 12, 500), device=self.device.type)
         except Exception as e:
-            print("Summary matrix skipped:", e)
+            print("Summary generation skipped structure matrix:", e)
+
+    def compute_metrics(self, y_true, y_pred):
+        acc = accuracy_score(y_true, y_pred)
+        # Macro averaging utilized to weigh minor arrhythmia boundaries identically
+        prec = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        rec = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        return acc, prec, rec, f1
 
     def train(self):
         from getData import get_dataloaders
         
-        print(f"Acquiring Pipeline Link for: {self.root} ...")
-        self.dataloader, self.test_dataloader = get_dataloaders(self.root, batch_size=self.batch_size, balance=True)
-
+        self.train_loader, self.val_loader, self.test_loader = get_dataloaders(self.root, batch_size=self.batch_size)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
 
-        bestAcc = 0
+        best_f1 = 0
         
-        print(f"\nExecution Initialized -> Bound to {self.device} Processor.")
         for e in range(self.n_epochs):
             self.model.train()
             train_loss_accum = 0.0
-            total_train = 0
-            correct_train = 0
+            y_true_train, y_pred_train = [], []
             
-            for i, (img, label) in enumerate(self.dataloader):
-                img = img.to(self.device).type(self.Tensor)
-                label = label.to(self.device).type(self.LongTensor)
+            for i, (img, label) in enumerate(self.train_loader):
+                img = img.to(self.device)
+                label = label.to(self.device)
                 
                 tok, outputs = self.model(img)
                 loss = self.criterion_cls(outputs, label)
@@ -188,48 +237,70 @@ class Trans():
                 
                 train_loss_accum += loss.item()
                 preds = torch.max(outputs, 1)[1]
-                correct_train += (preds == label).sum().item()
-                total_train += label.size(0)
+                
+                y_true_train.extend(label.cpu().numpy())
+                y_pred_train.extend(preds.cpu().numpy())
 
             self.model.eval()
-            test_loss_accum = 0.0
-            total_test = 0
-            correct_test = 0
+            val_loss_accum = 0.0
+            y_true_val, y_pred_val = [], []
             
             with torch.no_grad():
-                for i, (img, label) in enumerate(self.test_dataloader):
-                    img = img.to(self.device).type(self.Tensor)
-                    label = label.to(self.device).type(self.LongTensor)
+                for i, (img, label) in enumerate(self.val_loader):
+                    img = img.to(self.device)
+                    label = label.to(self.device)
                     
                     tok, outputs = self.model(img)
                     loss = self.criterion_cls(outputs, label)
                     
-                    test_loss_accum += loss.item()
+                    val_loss_accum += loss.item()
                     preds = torch.max(outputs, 1)[1]
-                    correct_test += (preds == label).sum().item()
-                    total_test += label.size(0)
+                    
+                    y_true_val.extend(label.cpu().numpy())
+                    y_pred_val.extend(preds.cpu().numpy())
 
-            train_acc = correct_train / total_train
-            test_acc = correct_test / total_test
-            avg_train_loss = train_loss_accum / len(self.dataloader)
-            avg_test_loss = test_loss_accum / len(self.test_dataloader)
+            # Evaluate Metrics
+            tr_acc, tr_prec, tr_rec, tr_f1 = self.compute_metrics(y_true_train, y_pred_train)
+            vl_acc, vl_prec, vl_rec, vl_f1 = self.compute_metrics(y_true_val, y_pred_val)
             
-            print(f'Epoch: {e} | Train Loss: {avg_train_loss:.4f} | Test Loss: {avg_test_loss:.4f} | Train Acc: {train_acc:.4f} | Test Acc: {test_acc:.4f}')
-            self.log_write.write(f"{e}    {test_acc}\n")
+            avg_train_loss = train_loss_accum / len(self.train_loader)
+            avg_val_loss = val_loss_accum / len(self.val_loader)
             
-            if test_acc > bestAcc:
-                bestAcc = test_acc
+            out_str = (f"Epoch: {e} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} "
+                       f"| Val Acc: {vl_acc:.4f} | Prec: {vl_prec:.4f} | Rec: {vl_rec:.4f} | F1: {vl_f1:.4f}")
+            print(out_str)
+            self.log_write.write(out_str + "\n")
+            
+            if vl_f1 > best_f1:
+                best_f1 = vl_f1
                 state = self.model.module.state_dict() if hasattr(self.model, 'module') else self.model.state_dict()
-                torch.save(state, 'model_kaggle_best.pth')
+                torch.save(state, 'model_chapman_best.pth')
 
-        print(f'Architecture Testing Complete. Peak Test Score Set: {bestAcc:.4f}')
-        self.log_write.write(f'Maximum Evaluated Bound: {bestAcc}\n')
+        # Run Final Test set validation against highest Val boundaries
+        print("\nDeploying Independent Testing Pipeline on Held-out Set...")
+        self.model.load_state_dict(torch.load('model_chapman_best.pth'))
+        self.model.eval()
+        y_true_ts, y_pred_ts = [], []
+        
+        with torch.no_grad():
+            for i, (img, label) in enumerate(self.test_loader):
+                img = img.to(self.device)
+                label = label.to(self.device)
+                tok, outputs = self.model(img)
+                preds = torch.max(outputs, 1)[1]
+                y_true_ts.extend(label.cpu().numpy())
+                y_pred_ts.extend(preds.cpu().numpy())
+                
+        ts_acc, ts_prec, ts_rec, ts_f1 = self.compute_metrics(y_true_ts, y_pred_ts)
+        test_str = (f"\n[FINAL TEST SET] Accuracy: {ts_acc:.4f} | Precision: {ts_prec:.4f} "
+                    f"| Recall: {ts_rec:.4f} | F1-Score: {ts_f1:.4f}")
+        print(test_str)
+        self.log_write.write(test_str + "\n")
         self.log_write.close()
-        return bestAcc
 
 def main():
     seed_n = 42
-    print(f'Launching Kaggle 187x1 Dimensions... Seed lock: {seed_n}')
+    print(f'Initializing 12-Lead Space Matrix... Random seed bound to {seed_n}')
     random.seed(seed_n)
     np.random.seed(seed_n)
     torch.manual_seed(seed_n)

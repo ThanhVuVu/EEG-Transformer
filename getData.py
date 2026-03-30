@@ -1,95 +1,133 @@
 import os
-import pandas as pd
+import glob
 import numpy as np
 import torch
+from scipy.io import loadmat
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 
-def balance_dataset(X, y, target_samples_per_class=None):
-    """
-    Balances class distributions.
-    Majority classes are randomly undersampled. Minority classes oversampled with replacement.
-    """
-    unique_classes, counts = torch.unique(y, return_counts=True)
+# 4 Main Clinical Classes for Chapman Dataset mapped to integers
+SNOMED_MAPPING = {
+    "426783006": 0, # Normal Sinus Rhythm (SR)
+    "164889003": 1, # Atrial Fibrillation (AFIB)
+    "426177001": 2, # Sinus Bradycardia (SB)
+    "427084000": 3  # Sinus Tachycardia (ST)
+}
+
+class ChapmanDataset(Dataset):
+    def __init__(self, file_paths, labels, transform=None):
+        self.file_paths = file_paths
+        self.labels = labels
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.file_paths)
+        
+    def __getitem__(self, idx):
+        path = self.file_paths[idx]
+        label = self.labels[idx]
+        
+        # Lazy Loading the .mat file into RAM (120KB per file)
+        mat_data = loadmat(path)
+        # WFDB matrices universally store the sensor graph inside the 'val' dictionary key
+        signal = mat_data['val'] # Default shape: (12, 5000)
+        
+        # Sub-sampling strided sequence length to fit PyTorch max bounds efficiently
+        # Compressing from 5000 samples -> 500 samples (preserve major waveform shapes)
+        signal = signal[:, ::10] 
+        
+        # Pushing into Conv2D processing layout matching model limits: (Channels_spatial, H, W)
+        # Model processes exactly (1 Depth map, 12 Sensors, 500 Subsequence Length)
+        signal = np.expand_dims(signal, axis=0) # Shape -> (1, 12, 500)
+        
+        tensor_x = torch.tensor(signal, dtype=torch.float32)
+        tensor_y = torch.tensor(label, dtype=torch.long)
+        
+        return tensor_x, tensor_y
+
+def parse_hea_label(hea_path):
+    """Parses SNOMED strings out of the WFDB header bounds."""
+    with open(hea_path, 'r') as f:
+        for line in f:
+            if line.startswith("#Dx:"):
+                dx_str = line.replace("#Dx:", "").strip()
+                codes = [code.strip() for code in dx_str.split(",")]
+                # Map onto our filtered classes, using first diagnosis match found
+                for code in codes:
+                    if code in SNOMED_MAPPING:
+                        return SNOMED_MAPPING[code]
+    return None
+
+def prepare_data_lists(data_dir):
+    """Locates all records and restricts matching ones to 4 classes."""
+    all_hea = glob.glob(os.path.join(data_dir, "*.hea"))
+    valid_paths = []
+    valid_labels = []
     
-    if target_samples_per_class is None:
-        target_samples_per_class = int(np.median(counts.numpy()))
-        print(f"Auto-Balance active: Targeting precisely {target_samples_per_class} instances per class.")
+    for hea in all_hea:
+        label = parse_hea_label(hea)
+        if label is not None:
+            mat_path = hea.replace(".hea", ".mat")
+            if os.path.exists(mat_path):
+                valid_paths.append(mat_path)
+                valid_labels.append(label)
+                
+    return valid_paths, valid_labels
 
-    balanced_X = []
-    balanced_y = []
-
+def balance_indices(labels):
+    """Enforces mathematical balance matching the median frequency class distribution limits."""
+    unique_classes, counts = np.unique(labels, return_counts=True)
+    target_count = int(np.median(counts))
+    print(f"Balancing Train dataset: Targeting uniform {target_count} samples per diagnosis class.")
+    
+    balanced_idx = []
+    labels = np.array(labels)
+    
     for cls in unique_classes:
-        indices = torch.where(y == cls)[0]
-        n_available = len(indices)
-        
-        if n_available >= target_samples_per_class:
-            chosen_idx = indices[torch.randperm(n_available)[:target_samples_per_class]]
+        idx = np.where(labels == cls)[0]
+        if len(idx) >= target_count:
+            # Undersample the dominant class
+            chosen = np.random.choice(idx, target_count, replace=False)
         else:
-            repeats = target_samples_per_class // n_available
-            rem = target_samples_per_class % n_available
-            rem_idx = indices[torch.randperm(n_available)[:rem]]
-            chosen_idx = torch.cat([indices.repeat(repeats), rem_idx])
-            
-        chosen_idx = chosen_idx[torch.randperm(len(chosen_idx))]    
-            
-        balanced_X.append(X[chosen_idx])
-        balanced_y.append(y[chosen_idx])
-        
-    X_bal = torch.cat(balanced_X)
-    y_bal = torch.cat(balanced_y)
+            # Oversample the minority class
+            repeats = target_count // len(idx)
+            rem = target_count % len(idx)
+            chosen = np.concatenate([np.repeat(idx, repeats), np.random.choice(idx, rem, replace=False)])
+        balanced_idx.extend(chosen)
     
-    perm = torch.randperm(len(y_bal))
-    return X_bal[perm], y_bal[perm]
+    np.random.shuffle(balanced_idx)
+    return balanced_idx
 
-def load_mitbih_kag_data(data_file, balance=True, target_samples=None):
-    """
-    Loads the preprocessed Kaggle Heartbeat Categorization Dataset.
-    Columns 0-186 are sequence tensors. Column 187 is the integer label.
-    """
-    print(f"Extracting memory block from {data_file}...")
-    df = pd.read_csv(data_file, header=None)
+def get_dataloaders(data_dir, batch_size=64):
+    """Core function exporting the Pipeline Loaders to the Model."""
+    print(f"Scanning raw root tree {data_dir} ...")
+    paths, labels = prepare_data_lists(data_dir)
+    print(f"Successfully processed {len(paths)} clinical matrices matching Target Maps.")
     
-    # Slicing the dataframe
-    features = df.iloc[:, :-1].values  # Shape: (N, 187)
-    labels = df.iloc[:, -1].values      # Shape: (N,)
+    # 80 / 10 / 10 Deterministic Split System
+    X_train_val, X_test, y_train_val, y_test = train_test_split(paths, labels, test_size=0.1, stratify=labels, random_state=42)
+    # The remaining 90% is split 8/9 Train (~80% total) and 1/9 Val (10% total)
+    X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=1/9, stratify=y_train_val, random_state=42)
     
-    # Expand to user-requested architecture parsing format: (batch, 1, 1, 187)
-    X = np.expand_dims(features, axis=1) # (N, 1, 187)
-    X = np.expand_dims(X, axis=1)        # (N, 1, 1, 187)
+    print(f"Split Volumes -> Train: {len(X_train)}, Validation: {len(X_val)}, Test: {len(X_test)}")
     
-    X_tensor = torch.tensor(X, dtype=torch.float32)
-    y_tensor = torch.tensor(labels, dtype=torch.long)
+    # Only Train subset undergoes Balancing. Val and Test are purely independent Real-World frequencies.
+    bal_train_idx = balance_indices(y_train)
+    X_train_bal = [X_train[i] for i in bal_train_idx]
+    y_train_bal = [y_train[i] for i in bal_train_idx]
     
-    print(f"Raw un-balanced shape: {X_tensor.shape}")
+    # Export bounds into Dataset formats dynamically loading on call requests
+    train_ds = ChapmanDataset(X_train_bal, y_train_bal)
+    val_ds = ChapmanDataset(X_val, y_val)
+    test_ds = ChapmanDataset(X_test, y_test)
     
-    if balance:
-        X_tensor, y_tensor = balance_dataset(X_tensor, y_tensor, target_samples)
-        
-    print(f"Final Input Tensor: {X_tensor.shape} \nOutput Label Map: {y_tensor.shape}\n")
-    return X_tensor, y_tensor
-
-def get_dataloaders(data_dir, batch_size=64, balance=True, target_samples=None):
-    from torch.utils.data import TensorDataset, DataLoader
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     
-    train_file = os.path.join(data_dir, "mitbih_train.csv")
-    test_file = os.path.join(data_dir, "mitbih_test.csv")
-    
-    if not os.path.exists(train_file):
-        raise FileNotFoundError(f"Could not find {train_file}")
-        
-    # We heavily balance the training set to prevent bias, but we leave the TEST
-    # set completely raw and unbounded so accuracy translates to real-world skew probability.
-    X_train, y_train = load_mitbih_kag_data(train_file, balance=balance, target_samples=target_samples)
-    X_test, y_test = load_mitbih_kag_data(test_file, balance=False)
-    
-    train_dataset = TensorDataset(X_train, y_train)
-    test_dataset = TensorDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, test_loader
+    return train_loader, val_loader, test_loader
 
 if __name__ == '__main__':
-    data_folder = r"d:\archive (1)"
-    get_dataloaders(data_folder, balance=True)
-    print("Testing functionality passed correctly!")
+    dl, vl, tl = get_dataloaders(r"d:\12 lead ECG\WFDB_ChapmanShaoxing", batch_size=64)
+    x, y = next(iter(dl))
+    print(f"Tensor Pipeline Verified. Exported exact boundaries: Tensor Shape {x.shape}, Diagnostic Nodes {y.shape}")
