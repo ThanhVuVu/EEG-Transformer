@@ -23,11 +23,12 @@ class PatchEmbedding(nn.Module):
     def __init__(self, emb_size):
         super().__init__()
         self.projection = nn.Sequential(
+            # Single channel input parsing for Kaggle Heartbeat Dataset
             nn.Conv2d(1, 2, (1, 51), (1, 1)),
             nn.BatchNorm2d(2),
             nn.LeakyReLU(0.2),
-            # MIT-BIH shape modification: Height dimension of the kernel lowered to 2 channels
-            nn.Conv2d(2, emb_size, (2, 5), stride=(1, 5)), 
+            # Height drops from 2 -> 1 for scalar mapping depth
+            nn.Conv2d(2, emb_size, (1, 5), stride=(1, 5)), 
             Rearrange('b e (h) (w) -> b (h w) e'),
         )
         self.cls_token = nn.Parameter(torch.randn(1, 1, emb_size))
@@ -117,27 +118,28 @@ class ClassificationHead(nn.Sequential):
         return x, out
 
 class channel_attention(nn.Module):
-    # Modified parameters for MIT-BIH shape: seq_len=250, channels=2
-    def __init__(self, sequence_num=250, inter=25):
+    # Dimensions altered for 187 seq length and exactly 1 spatial channel
+    def __init__(self, sequence_num=187, inter=11):
         super(channel_attention, self).__init__()
         self.sequence_num = sequence_num
         self.inter = inter
         self.extract_sequence = int(self.sequence_num / self.inter)
 
+        # Depth scalars mapped perfectly to 1
         self.query = nn.Sequential(
-            nn.Linear(2, 2),
-            nn.LayerNorm(2),
+            nn.Linear(1, 1),
+            nn.LayerNorm(1),
             nn.Dropout(0.3)
         )
         self.key = nn.Sequential(
-            nn.Linear(2, 2),
-            nn.LayerNorm(2),
+            nn.Linear(1, 1),
+            nn.LayerNorm(1),
             nn.Dropout(0.3)
         )
 
         self.projection = nn.Sequential(
-            nn.Linear(2, 2),
-            nn.LayerNorm(2),
+            nn.Linear(1, 1),
+            nn.LayerNorm(1),
             nn.Dropout(0.3),
         )
 
@@ -174,7 +176,7 @@ class ViT(nn.Sequential):
         super().__init__(
             ResidualAdd(
                 nn.Sequential(
-                    nn.LayerNorm(250), # Sequence length modified from 1000 to 250
+                    nn.LayerNorm(187), # Core length parameter matched to 187
                     channel_attention(),
                     nn.Dropout(0.5),
                 )
@@ -188,41 +190,46 @@ class Trans():
     def __init__(self):
         super(Trans, self).__init__()
         self.batch_size = 64
-        self.n_epochs = 50 # Reduced from 1000 since dataset is large (28900 train instances per epoch)
-        self.img_height = 2
-        self.img_width = 250
+        self.n_epochs = 50
+        self.img_height = 1
+        self.img_width = 187
         self.channels = 1
         self.lr = 0.0002
         self.b1 = 0.5
         self.b2 = 0.9
-        self.root = r'd:\archive'  # Local data folder path directly provided to loader
+        self.root = r'd:\archive (1)'  # New Kaggle local dir mapping
         
         os.makedirs("./results/", exist_ok=True)
         self.log_write = open("./results/log_mitbih_training.txt", "w")
 
-        self.Tensor = torch.cuda.FloatTensor
-        self.LongTensor = torch.cuda.LongTensor
-
-        self.criterion_cls = torch.nn.CrossEntropyLoss().cuda()
-
-        self.model = ViT().cuda()
-        self.model = nn.DataParallel(self.model, device_ids=[i for i in range(len(gpus))])
-        self.model = self.model.cuda()
+        # Fallbacks for seamless remote execution regardless of accelerators
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Output summary with dynamic architectural inputs
-        summary(self.model, (1, 2, 250))
+        self.Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+        self.LongTensor = torch.cuda.LongTensor if torch.cuda.is_available() else torch.LongTensor
+
+        self.criterion_cls = torch.nn.CrossEntropyLoss().to(self.device)
+
+        self.model = ViT().to(self.device)
+        if torch.cuda.is_available():
+            self.model = nn.DataParallel(self.model, device_ids=[i for i in range(len(gpus))])
+        
+        try:
+            summary(self.model, (1, 1, 187), device=self.device.type)
+        except Exception as e:
+            print("Summary matrix skipped:", e)
 
     def train(self):
         from getData import get_dataloaders
         
-        print(f"Linking Data Pipeline to target folder: {self.root} ...")
+        print(f"Acquiring Pipeline Link for: {self.root} ...")
         self.dataloader, self.test_dataloader = get_dataloaders(self.root, batch_size=self.batch_size, balance=True)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
 
         bestAcc = 0
         
-        print("\nFiring Training Initialized...")
+        print(f"\nExecution Initialized -> Bound to {self.device} Processor.")
         for e in range(self.n_epochs):
             self.model.train()
             train_loss_accum = 0.0
@@ -230,8 +237,8 @@ class Trans():
             correct_train = 0
             
             for i, (img, label) in enumerate(self.dataloader):
-                img = img.cuda().type(self.Tensor)
-                label = label.cuda().type(self.LongTensor)
+                img = img.to(self.device).type(self.Tensor)
+                label = label.to(self.device).type(self.LongTensor)
                 
                 tok, outputs = self.model(img)
                 loss = self.criterion_cls(outputs, label)
@@ -245,7 +252,6 @@ class Trans():
                 correct_train += (preds == label).sum().item()
                 total_train += label.size(0)
 
-            # Standardized validation batches to prevent large VRAM OOM error on long testing structures
             self.model.eval()
             test_loss_accum = 0.0
             total_test = 0
@@ -253,8 +259,8 @@ class Trans():
             
             with torch.no_grad():
                 for i, (img, label) in enumerate(self.test_dataloader):
-                    img = img.cuda().type(self.Tensor)
-                    label = label.cuda().type(self.LongTensor)
+                    img = img.to(self.device).type(self.Tensor)
+                    label = label.to(self.device).type(self.LongTensor)
                     
                     tok, outputs = self.model(img)
                     loss = self.criterion_cls(outputs, label)
@@ -274,21 +280,23 @@ class Trans():
             
             if test_acc > bestAcc:
                 bestAcc = test_acc
-                torch.save(self.model.module.state_dict(), 'model_best.pth')
+                state = self.model.module.state_dict() if hasattr(self.model, 'module') else self.model.state_dict()
+                torch.save(state, 'model_kaggle_best.pth')
 
-        print(f'Training Deployment Concluded. High Score Testing Set Accuracy: {bestAcc:.4f}')
-        self.log_write.write(f'Best Architecture Yield Accuracy: {bestAcc}\n')
+        print(f'Architecture Testing Complete. Peak Test Score Set: {bestAcc:.4f}')
+        self.log_write.write(f'Maximum Evaluated Bound: {bestAcc}\n')
         self.log_write.close()
         return bestAcc
 
 def main():
     seed_n = 42
-    print(f'Starting Monolithic Architecture Run. Base seed: {seed_n}')
+    print(f'Launching Kaggle 187x1 Dimensions... Seed lock: {seed_n}')
     random.seed(seed_n)
     np.random.seed(seed_n)
     torch.manual_seed(seed_n)
-    torch.cuda.manual_seed(seed_n)
-    torch.cuda.manual_seed_all(seed_n)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_n)
+        torch.cuda.manual_seed_all(seed_n)
     
     trans = Trans()
     trans.train()
